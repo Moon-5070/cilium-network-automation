@@ -1,0 +1,18 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-frontend-egress-to-backend
+  namespace: frontend
+spec:
+  endpointSelector:
+    matchLabels:
+      app: frontend
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: backend
+        app: backend
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP

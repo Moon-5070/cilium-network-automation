@@ -1,0 +1,18 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-backend-egress-to-database
+  namespace: backend
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: database
+        app: database
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
