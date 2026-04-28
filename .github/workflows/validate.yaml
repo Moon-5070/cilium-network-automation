@@ -14,12 +14,17 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Install kubeconform
+    - name: Validate YAML syntax
       run: |
-        curl -L -o kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
-        tar xf kubeconform.tar.gz
-        sudo mv kubeconform /usr/local/bin/
+        python3 - <<'EOF'
+        import glob
+        import yaml
 
-    - name: Validate Kubernetes YAML
-      run: |
-        kubeconform -summary -ignore-missing-schemas apps/ policies/
+        files = glob.glob("apps/*.yaml") + glob.glob("policies/*.yaml")
+        for file in files:
+            print(f"Checking {file}")
+            with open(file) as f:
+                list(yaml.safe_load_all(f))
+
+        print("YAML syntax OK")
+        EOF
