@@ -3,6 +3,8 @@ kind: CiliumNetworkPolicy
 metadata:
   name: allow-frontend-egress-to-backend
   namespace: frontend
+  annotations:
+    gitops-test: "true"
 spec:
   endpointSelector:
     matchLabels:
