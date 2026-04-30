@@ -13,16 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-POLICY_PATH = Path("policies/99-deny-frontend-to-database-generated.yaml")
+POLICY_PATH = Path("policies/99-deny-google-generated.yaml")
 VIOLATION_LOG_PATH = Path("logs/hubble_violations.log")
 CILIUM_NAMESPACE = "kube-system"
 CILIUM_LABEL_SELECTOR = "k8s-app=cilium"
 
 RULES = [
     {
-        "name": "deny-frontend-to-database",
+        "name": "deny-google-com",
         "source_namespace": "frontend",
-        "destination_namespace": "database",
+        "destination": "google.com",
         "action": "deny",
     }
 ]
@@ -32,22 +32,14 @@ RULES = [
 class Rule:
     name: str
     source_namespace: str
-    destination_namespace: str
+    destination: str
     action: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--apply-immediately",
-        action="store_true",
-        help="Run kubectl apply -f on the generated policy as soon as a violation is detected.",
-    )
-    parser.add_argument(
-        "--auto-push",
-        action="store_true",
-        help="Run git push after committing generated policy changes.",
-    )
+    parser.add_argument("--apply-immediately", action="store_true")
+    parser.add_argument("--auto-push", action="store_true")
     return parser.parse_args()
 
 
@@ -58,9 +50,9 @@ def setup_logging() -> None:
 def get_namespace(flow: dict[str, Any], endpoint_key: str) -> str | None:
     endpoint = flow.get(endpoint_key, {})
     if isinstance(endpoint, dict):
-        namespace = endpoint.get("namespace")
-        if isinstance(namespace, str):
-            return namespace
+        ns = endpoint.get("namespace")
+        if isinstance(ns, str):
+            return ns
     return None
 
 
@@ -68,10 +60,37 @@ def load_rules() -> list[Rule]:
     return [Rule(**raw_rule) for raw_rule in RULES]
 
 
+def _domain_matches(domain: str, target: str) -> bool:
+    return domain == target or domain.endswith(f".{target}")
+
+
+def flow_targets_domain(flow: dict[str, Any], target_domain: str) -> bool:
+    l7 = flow.get("l7", {})
+    if isinstance(l7, dict):
+        dns = l7.get("dns", {})
+        if isinstance(dns, dict):
+            query = dns.get("query")
+            if isinstance(query, str) and _domain_matches(query.rstrip('.'), target_domain):
+                return True
+
+    destination_names = flow.get("destinationNames", [])
+    if isinstance(destination_names, list):
+        for name in destination_names:
+            if isinstance(name, str) and _domain_matches(name.rstrip('.'), target_domain):
+                return True
+
+    ip = flow.get("IP", {})
+    if isinstance(ip, dict):
+        dst = ip.get("destination")
+        if isinstance(dst, str) and _domain_matches(dst.rstrip('.'), target_domain):
+            return True
+
+    return False
+
+
 def match_rule(flow: dict[str, Any], rule: Rule) -> bool:
     src_ns = get_namespace(flow, "source")
-    dst_ns = get_namespace(flow, "destination")
-    return src_ns == rule.source_namespace and dst_ns == rule.destination_namespace
+    return src_ns == rule.source_namespace and flow_targets_domain(flow, rule.destination)
 
 
 def render_policy_yaml(rule: Rule) -> str:
@@ -84,17 +103,17 @@ metadata:
 spec:
   endpointSelector: {{}}
   egressDeny:
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {rule.destination_namespace}
+    - toFQDNs:
+        - matchName: {rule.destination}
+        - matchPattern: "*.{rule.destination}"
 """
 
 
 def write_policy(path: Path, rule: Rule) -> str:
-    policy_yaml = render_policy_yaml(rule)
+    yaml = render_policy_yaml(rule)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(policy_yaml, encoding="utf-8")
-    return policy_yaml
+    path.write_text(yaml, encoding="utf-8")
+    return yaml
 
 
 def log_violation(flow: dict[str, Any], rule: Rule) -> None:
@@ -111,117 +130,65 @@ def log_violation(flow: dict[str, Any], rule: Rule) -> None:
 
 def maybe_commit_and_push_policy(path: Path, auto_push: bool) -> None:
     subprocess.run(["git", "add", str(path)], check=True)
-
     has_staged_changes = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
     if has_staged_changes.returncode == 0:
         logging.info("No staged changes for policy; skipping commit/push")
         return
-
-    commit_msg = "chore(policy): update generated deny frontend-to-database policy"
-    subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-    logging.info("Committed generated policy to git")
-
+    subprocess.run(["git", "commit", "-m", "chore(policy): update generated deny google policy"], check=True)
     if auto_push:
         subprocess.run(["git", "push"], check=True)
-        logging.info("Pushed generated policy commit")
 
 
 def apply_policy_now(path: Path) -> None:
     subprocess.run(["kubectl", "apply", "-f", str(path)], check=True)
-    logging.info("Applied policy immediately: %s", path)
 
 
 def get_cilium_pod_name() -> str:
-    cmd = [
-        "kubectl",
-        "-n",
-        CILIUM_NAMESPACE,
-        "get",
-        "pods",
-        "-l",
-        CILIUM_LABEL_SELECTOR,
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ]
+    cmd = ["kubectl", "-n", CILIUM_NAMESPACE, "get", "pods", "-l", CILIUM_LABEL_SELECTOR, "-o", "jsonpath={.items[0].metadata.name}"]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     pod_name = result.stdout.strip()
     if not pod_name:
-        raise RuntimeError(
-            f"No Cilium pod found in namespace '{CILIUM_NAMESPACE}' with label '{CILIUM_LABEL_SELECTOR}'."
-        )
+        raise RuntimeError("No Cilium pod found")
     return pod_name
 
 
 def monitor_flows(rules: list[Rule], apply_immediately: bool, auto_push: bool) -> None:
     seen_policy_digests: set[str] = set()
     cilium_pod = get_cilium_pod_name()
-    cmd = [
-        "kubectl",
-        "-n",
-        CILIUM_NAMESPACE,
-        "exec",
-        cilium_pod,
-        "--",
-        "hubble",
-        "observe",
-        "-o",
-        "json",
-    ]
-    logging.info("Starting flow monitor via cilium pod %s", cilium_pod)
-
+    cmd = ["kubectl", "-n", CILIUM_NAMESPACE, "exec", cilium_pod, "--", "hubble", "observe", "-o", "json"]
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1) as proc:
         assert proc.stdout is not None
-
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
-
             try:
                 flow = json.loads(line)
             except json.JSONDecodeError:
-                logging.debug("Skipping non-JSON line: %s", line)
                 continue
-
             for rule in rules:
-                if rule.action != "deny":
+                if rule.action != "deny" or not match_rule(flow, rule):
                     continue
-                if not match_rule(flow, rule):
-                    continue
-
                 logging.warning("Violation detected for rule %s", rule.name)
                 log_violation(flow, rule)
                 policy_yaml = write_policy(POLICY_PATH, rule)
                 digest = hashlib.sha256(policy_yaml.encode("utf-8")).hexdigest()
                 if digest in seen_policy_digests:
-                    logging.info("Duplicate policy content detected; skip duplicate commit/apply")
                     continue
-
                 seen_policy_digests.add(digest)
                 maybe_commit_and_push_policy(POLICY_PATH, auto_push=auto_push)
-
                 if apply_immediately:
                     apply_policy_now(POLICY_PATH)
-
-        return_code = proc.wait()
-        if return_code != 0:
-            err = proc.stderr.read() if proc.stderr else ""
-            raise RuntimeError(f"kubectl exec hubble observe exited with code {return_code}: {err.strip()}")
 
 
 def main() -> None:
     args = parse_args()
     setup_logging()
     rules = load_rules()
-
     try:
         monitor_flows(rules, apply_immediately=args.apply_immediately, auto_push=args.auto_push)
-    except FileNotFoundError as exc:
-        logging.error("Failed to run required command: %s", exc)
-        raise SystemExit(1) from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.strip() if exc.stderr else str(exc)
-        logging.error("Command failed: %s", stderr)
+    except (FileNotFoundError, subprocess.CalledProcessError, RuntimeError) as exc:
+        logging.error("Monitor failed: %s", exc)
         raise SystemExit(1) from exc
     except KeyboardInterrupt:
         logging.info("Stopped by user")
